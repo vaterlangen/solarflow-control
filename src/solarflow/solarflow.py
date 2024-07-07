@@ -350,6 +350,19 @@ class Solarflow:
                         sn = pack.pop('sn')
                         for prop, val in pack.items():
                             self.client.publish(f'solarflow-hub/{device_id}/telemetry/batteries/{sn}/{prop}',val)
+                            
+            if "modules" in payload:
+                modules = payload["modules"]
+                if len(modules) > 0:
+                    for module in modules:
+                        self.client.publish(f'solarflow-hub/{device_id}/telemetry/modules/{module.pop('module')}',module.pop('version'))
+                            
+                            
+            if "firmwares" in payload:
+                firmwares = payload["firmwares"]
+                if len(firmwares) > 0:
+                    for firmware in firmwares:
+                        self.client.publish(f'solarflow-hub/{device_id}/telemetry/firmwares/{firmware.pop('type')}',firmware.pop('version'))
 
         if msg.topic.startswith('solarflow-hub') and msg.payload:
             # check if we got regular updates on solarInputPower
