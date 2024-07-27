@@ -52,6 +52,8 @@ mqtt_pwd = config.get('mqtt', 'mqtt_pwd', fallback=None) or os.environ.get('MQTT
 mqtt_host = config.get('mqtt', 'mqtt_host', fallback=None) or os.environ.get('MQTT_HOST',None)
 mqtt_port = config.getint('mqtt', 'mqtt_port', fallback=None) or os.environ.get('MQTT_PORT',1883)
 
+DEBUG =                 config.getboolean('global', 'debug', fallback=None) \
+                        or bool(os.environ.get('DEBUG',False))
 
 DTU_TYPE =              config.get('global', 'dtu_type', fallback=None) \
                         or os.environ.get('DTU_TYPE',"OpenDTU")
@@ -78,6 +80,11 @@ MAX_INVERTER_LIMIT =    config.getint('control', 'max_inverter_limit', fallback=
                         or int(os.environ.get('MAX_INVERTER_LIMIT',800))
 MAX_INVERTER_INPUT =    config.getint('control', 'max_inverter_input', fallback=None) \
                         or int(os.environ.get('MAX_INVERTER_INPUT',MAX_INVERTER_LIMIT - MIN_CHARGE_POWER))
+                        
+MAX_GRID_FEED      =    config.getint('control', 'max_grid_feed', fallback=None) \
+                        or int(os.environ.get('MAX_GRID_FEED',MAX_INVERTER_LIMIT))
+FEED_HYSTERESIS    =    config.getint('control', 'grid_feed_hysteresis', fallback=None) \
+                        or int(os.environ.get('GIRD_FEED_HYSTERESIS',50))
 
 # this controls the internal calculation of limited growth for setting inverter limits
 INVERTER_START_LIMIT = 5
@@ -149,7 +156,7 @@ def on_connect(client, userdata, flags, rc):
         hub.setInverseMaxPower(MAX_INVERTER_INPUT)
         hub.setBatteryHighSoC(BATTERY_HIGH)
         hub.setBatteryLowSoC(BATTERY_LOW)
-        if hub.control_bypass:
+        if hub.control_bypass and not DEBUG:
             hub.setBypass(False)
             hub.setAutorecover(False)
         inv = client._userdata['dtu']
@@ -190,14 +197,34 @@ def limitedRise(x) -> int:
 
 
 # calculate the safe inverter limit for direct panels, to avoid output over legal limits
-def getDirectPanelLimit(inv, hub, smt) -> int:
+def getDirectPanelLimit(inv, hub, smt, demand, feed:int=0) -> int:
     # if hub is in bypass mode we can treat it just like a direct panel
     direct_panel_power = inv.getDirectACPower() + (inv.getHubACPower() if hub.getBypass() else 0)
-    if direct_panel_power < MAX_INVERTER_LIMIT:
-        dc_values = (inv.getDirectDCPowerValues() + inv.getHubDCPowerValues()) if hub.getBypass() else inv.getDirectDCPowerValues()
-        return math.ceil(max(dc_values) * (inv.getEfficiency()/100)) if smt.getPower() - smt.zero_offset < 0 else limitedRise(max(dc_values) * (inv.getEfficiency()/100))
-    else:
+    metered_power = smt.getPower() - smt.zero_offset
+    old = inv.getChannelLimit()
+    
+    # if limit is reached, apply hard limit 
+    if direct_panel_power >= MAX_INVERTER_LIMIT:
+        log.info(f'Inverter limit of {MAX_INVERTER_LIMIT}W reached!')
         return int(MAX_INVERTER_LIMIT*(inv.getNrHubChannels()/inv.getNrProducingChannels()))
+    
+    
+    threshold_low = -(feed + FEED_HYSTERESIS)
+    threshold_high = -(feed - FEED_HYSTERESIS)
+    limit = int((demand + feed) / inv.getNrProducingChannels())
+    delta = abs(old - limit)
+    
+    log.info(f'not({threshold_low} < {metered_power} < {threshold_high}) and {delta} > 8')
+    log.info(f'not({threshold_low < metered_power < threshold_high}) and {delta > 8}')
+    
+    # check if we should increase output
+    if not(threshold_low < metered_power < threshold_high) and delta > 8:
+        log.info(f'Updateing inverter limit: {old:.0f} => {limit:.0f}W [!{threshold_low} < {metered_power} < {threshold_high}]')
+        return limit
+    
+    # fallback - keep old limit
+    log.info(f'Keeping inverter limit at {old:.0f}')
+    return old
 
 def getSFPowerLimit(hub, demand) -> int:
     hub_electricLevel = hub.getElectricLevel()
@@ -314,7 +341,7 @@ def limitHomeInput(client: mqtt_client):
             log.info(f'Direct connected panels ({direct_panel_power:.1f}W) can cover demand ({demand:.1f}W)')
             #direct_limit = getDirectPanelLimit(inv,hub,smt)
             # keep inverter limit where it is, no need to change
-            direct_limit = getDirectPanelLimit(inv,hub,smt)
+            direct_limit = getDirectPanelLimit(inv,hub,smt,demand,MAX_GRID_FEED)
             hub_limit = hub.setOutputLimit(0)
         else:
             # we need contribution from hub, if possible and/or try to get more from direct panels
@@ -323,30 +350,32 @@ def limitHomeInput(client: mqtt_client):
                 # is there potentially more to get from direct panels?
                 # if the direct channel power is below what is theoretically possible, it is worth trying to increase the limit
 
+                maxdcpower = max(inv.getDirectDCPowerValues()) * (inv.getEfficiency()/100)
+                
                 # if the max of direct channel power is close to the channel limit we should increase the limit first to eventually get more from direct panels 
-                if inv.isWithin(max(inv.getDirectDCPowerValues()) * (inv.getEfficiency()/100),inv.getChannelLimit(),10*inv.getNrTotalChannels()):
-                    log.info(f'The current max direct channel power {(max(inv.getDirectDCPowerValues()) * (inv.getEfficiency()/100)):.1f}W is close to the current channel limit {inv.getChannelLimit():.1f}W, trying to get more from direct panels.')
+                if inv.isWithin(maxdcpower,inv.getChannelLimit(),10*inv.getNrTotalChannels()):
+                    log.info(f'The current max direct channel power {maxdcpower:.1f}W is close to the current channel limit {inv.getChannelLimit():.1f}W, trying to get more from direct panels.')
                     hub_limit = hub.getLimit()
-                    direct_limit = getDirectPanelLimit(inv,hub,smt)
+                    direct_limit = getDirectPanelLimit(inv,hub,smt,demand)
                 else:
                     # check what hub is currently  willing to contribute
                     sf_contribution = getSFPowerLimit(hub,hub_contribution_ask)
 
                     # would the hub's contribution plus direct panel power cross the AC limit? If yes only contribute up to the limit
                     if sf_contribution * (inv.getEfficiency()/100) + direct_panel_power  > inv.acLimit:
-                        log.info(f'Hub could contribute {sf_contribution:.1f}W, but this would exceed the configured AC limit ({inv.acLimit}W), so only asking for {inv.acLimit - direct_panel_power:.1f}W')
                         sf_contribution = inv.acLimit - direct_panel_power
+                        log.info(f'Hub could contribute {sf_contribution:.1f}W, but this would exceed the configured AC limit ({inv.acLimit}W), so only asking for {sf_contribution:.1f}W')
 
                     # if the hub's contribution (per channel) is larger than what the direct panels max is delivering (night, low light)
                     # then we can open the hub to max limit and use the inverter to limit it's output (more precise)
-                    if sf_contribution/inv.getNrHubChannels() >= max(inv.getDirectDCPowerValues()) * (inv.getEfficiency()/100):
-                        log.info(f'Hub should contribute more ({sf_contribution:.1f}W) than what we currently get max from panels ({max(inv.getDirectDCPowerValues()) * (inv.getEfficiency()/100):.1f}W), we will use the inverter for fast/precise limiting!')
+                    if sf_contribution/inv.getNrHubChannels() >= maxdcpower:
+                        log.info(f'Hub should contribute more ({sf_contribution:.1f}W) than what we currently get max from panels ({maxdcpower:.1f}W), we will use the inverter for fast/precise limiting!')
                         hub_limit = hub.setOutputLimit(0) if hub.getBypass() else hub.setOutputLimit(hub.getInverseMaxPower())
                         direct_limit = sf_contribution/inv.getNrHubChannels()
                     else:
                         hub_limit = hub.setOutputLimit(0) if hub.getBypass() else hub.setOutputLimit(sf_contribution)
                         log.info(f'Hub is willing to contribute {min(hub_limit,hub_contribution_ask):.1f}W of the requested {hub_contribution_ask:.1f}!')
-                        direct_limit = getDirectPanelLimit(inv,hub,smt)
+                        direct_limit = getDirectPanelLimit(inv,hub,smt,demand)
                         log.info(f'Direct connected panel limit is {direct_limit}W.')
 
     # likely no sun, not producing, eveything comes from hub
@@ -360,6 +389,7 @@ def limitHomeInput(client: mqtt_client):
 
 
     if direct_limit != None:
+        log.info(f'ENTRY: direct_limit: {direct_limit} | hub_limit: {hub_limit}')
 
         limit = direct_limit
 
@@ -367,6 +397,8 @@ def limitHomeInput(client: mqtt_client):
             limit = hub_limit - 10
         if direct_limit < hub_limit - 10 and hub_limit < hub.getInverseMaxPower():
             limit = hub_limit - 10
+            
+        log.info(f'EXIT: direct_limit: {direct_limit} | hub_limit: {hub_limit}')
 
         inv_limit = inv.setLimit(limit)
 
@@ -512,6 +544,9 @@ def main(argv):
     log.info(f'  SUNSET_OFFSET = {SUNSET_OFFSET}')
     log.info(f'  BATTERY_LOW = {BATTERY_LOW}')
     log.info(f'  BATTERY_HIGH = {BATTERY_HIGH}')
+    
+    if DEBUG:
+        log.warning(f'>>> DEBUGMODE ENABLED <<<')
 
     loc = MyLocation()
     if not LNG and not LAT:
