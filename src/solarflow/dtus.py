@@ -250,7 +250,7 @@ class DTU:
             log.info(f'{"[DRYRUN] " if self.dryrun else ""}Setting inverter output limit to {inv_limit}W (1 min moving average of {limit}W x {len(self.channelsDCPower)-1})')
         else:
             not self.reachable and log.info(f'{"[DRYRUN] " if self.dryrun else ""}Inverter is not reachable/down. Can\'t set limit')
-            self.reachable and log.info(f'Not setting inverter output limit as it is identical to current limit!')
+            self.reachable and log.info(f'Not setting inverter output limit to {inv_limit} as it is identical to current limit {self.limitAbsolute}!')
 
         return inv_limit
     
