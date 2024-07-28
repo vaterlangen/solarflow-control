@@ -431,8 +431,6 @@ def limitHomeInput(client: mqtt_client):
 
 
     if direct_limit != None:
-        log.info(f'ENTRY: direct_limit: {direct_limit} | hub_limit: {hub_limit}')
-
         limit = direct_limit
 
         if hub_limit > direct_limit > hub_limit - 10:
@@ -440,8 +438,6 @@ def limitHomeInput(client: mqtt_client):
         if direct_limit < hub_limit - 10 and hub_limit < hub.getInverseMaxPower():
             limit = hub_limit - 10
             
-        log.info(f'EXIT: direct_limit: {direct_limit} | hub_limit: {hub_limit}')
-
         inv_limit = inv.setLimit(limit)
 
     if remainder < 0:
